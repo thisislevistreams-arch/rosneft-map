@@ -1,34 +1,57 @@
 <!DOCTYPE html>
-<html>
+<html lang="ru">
 <head>
   <meta charset="utf-8">
   <title>Карта АЗС Роснефть</title>
   <script src="https://api-maps.yandex.ru/2.1/?apikey=f0b35562-f43f-4407-9729-14d98daca723&lang=ru_RU"></script>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <style>
-    html, body, #map {
-      width: 100%;
-      height: 100%;
-      margin: 0;
-      padding: 0;
-    }
+    html, body { margin: 0; padding: 0; height: 100%; }
+    #map { width: 100%; height: 100%; }
   </style>
 </head>
 <body>
   <div id="map"></div>
-  <script>
-    ymaps.ready(init);
-    function init(){
-        var map = new ymaps.Map("map", {
-            center: [55.7558, 37.6173], // Москва
-            zoom: 10,
-            controls: ['zoomControl', 'searchControl']
-        });
 
-        // Пример добавления точки (можно подгрузить JSON с реальными АЗС)
-        var placemark = new ymaps.Placemark([55.7558, 37.6173], {
-            balloonContent: "АЗС Роснефть — Москва, ул. Примерная, 1"
-        });
+  <script>
+    const tg = window.Telegram?.WebApp;
+    if (tg) {
+      tg.expand();
+      tg.MainButton.text = "Закрыть карту";
+      tg.MainButton.show();
+      tg.MainButton.onClick(() => tg.close());
+    }
+
+    ymaps.ready(init);
+
+    function init() {
+      const map = new ymaps.Map("map", {
+        center: [55.7558, 37.6173],
+        zoom: 9,
+        controls: ['zoomControl', 'geolocationControl', 'searchControl']
+      });
+
+      const stations = [
+        { coords: [55.7558, 37.6173], name: "АЗС Роснефть — Москва, Тверская ул., д.5" },
+        { coords: [55.7800, 37.6000], name: "АЗС Роснефть — Москва, Ленинградский пр., д.10" },
+        { coords: [55.7300, 37.5800], name: "АЗС Роснефть — Москва, Кутузовский пр., д.15" },
+        { coords: [59.9343, 30.3351], name: "АЗС Роснефть — Санкт-Петербург, Невский пр., д.50" },
+        { coords: [56.8389, 60.6057], name: "АЗС Роснефть — Екатеринбург, ул. Малышева, д.90" },
+        { coords: [55.0302, 82.9204], name: "АЗС Роснефть — Новосибирск, ул. Ленина, д.100" },
+        { coords: [53.1959, 50.1005], name: "АЗС Роснефть — Самара, ул. Московское шоссе, д.120" },
+        { coords: [55.0415, 82.9346], name: "АЗС Роснефть — Новосибирск, ул. Дуси Ковальчук, д.45" },
+        { coords: [54.9833, 73.3667], name: "АЗС Роснефть — Омск, ул. Ленина, д.200" },
+        { coords: [57.1522, 65.5272], name: "АЗС Роснефть — Тюмень, ул. Республики, д.35" }
+      ];
+
+      stations.forEach(station => {
+        const placemark = new ymaps.Placemark(
+          station.coords,
+          { balloonContent: station.name },
+          { preset: 'islands#orangeFuelStationIcon' }
+        );
         map.geoObjects.add(placemark);
+      });
     }
   </script>
 </body>
