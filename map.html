@@ -3,11 +3,11 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Карта АЗС Роснефть — WebApp</title>
+<title>Карта АЗС — Роснефть (динамическая)</title>
 
 <!-- Яндекс.Карты -->
 <script src="https://api-maps.yandex.ru/2.1/?apikey=f0b35562-f43f-4407-9729-14d98daca723&lang=ru_RU"></script>
-<!-- Telegram WebApp (для встроенного открытия в Telegram) -->
+<!-- Telegram WebApp (если открывать из Telegram) -->
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 
 <style>
@@ -24,6 +24,7 @@
   #count{margin-top:6px;font-size:13px;color:#333}
   .fuel-list{margin:6px 0;padding-left:16px}
   .service-tag{display:inline-block;background:#eef; color:#115; padding:3px 6px;border-radius:4px;margin-right:4px;font-size:12px}
+  .loader{color:#888;font-size:13px}
 </style>
 </head>
 <body>
@@ -37,6 +38,7 @@
       <button id="clearBtn" class="btn">Очистить метки</button>
     </div>
     <div id="count" class="small"></div>
+    <div id="loader" class="loader"></div>
   </div>
 
   <div id="list"></div>
@@ -46,10 +48,11 @@
 
 <script>
 /*
-  map.html
-  - Зависит от файла stations.json (в той же папке). Этот JSON создаётся из rncard.xlsx.
-  - Поведение: список в сайдбаре, клик — геокодируется адрес и ставится метка с детальной карточкой.
-  - Поддерживается кластеризация, поиск и ближайшие станции.
+  Dynamic map that loads stations.json placed next to map.html.
+  - stations.json should contain objects with fields:
+    { id, region, brand, address, lat, lng, fuels: {...}, services:{...}, nds }
+  - If lat/lng are missing, page will geocode address on demand and cache in memory (not persisted).
+  - Balloon template mirrors rn-card.ru template: brand, "№ x.y.z", address, distance, services, fuels.
 */
 
 const tg = window.Telegram?.WebApp;
@@ -57,214 +60,245 @@ if (tg) { try { tg.expand(); tg.MainButton.hide(); } catch(e){} }
 
 let map, clusterer;
 let stations = [];
-let geocodeCache = {}; // key: address -> [lat, lon]
+let geocodeCache = {}; // address -> [lat, lon]
 let shownPlacemarks = [];
+let userCoords = null;
 
-function setCount(text){ document.getElementById('count').innerText = text; }
+const STATIONS_JSON = 'stations.json';
 
-// загрузим stations.json (файл должен быть рядом с map.html)
-fetch('stations.json')
-  .then(r => r.json())
+function escapeHtml(t){ if(!t) return ''; return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function setLoader(t){ document.getElementById('loader').innerText = t || ''; }
+function setCount(t){ document.getElementById('count').innerText = t || ''; }
+
+// load stations JSON
+setLoader('Загружаем данные...');
+fetch(STATIONS_JSON)
+  .then(r => { if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
   .then(data => {
-    stations = data;
+    stations = data || [];
+    setLoader('');
     setCount('Всего станций: ' + stations.length);
-    renderList(stations.slice(0,500)); // initial (limit to avoid huge DOM)
+    renderList(stations.slice(0,500));
   })
   .catch(e => {
     console.error('Ошибка загрузки stations.json', e);
-    setCount('Ошибка загрузки данных.');
+    setLoader('Ошибка загрузки stations.json. Проверьте, что файл рядом с map.html и доступен.');
+    setCount('');
   });
 
 ymaps.ready(init);
 
-function init() {
-  map = new ymaps.Map('map', {
-    center: [55.76, 37.64],
-    zoom: 5,
-    controls: ['zoomControl','searchControl','geolocationControl']
-  });
-
-  clusterer = new ymaps.Clusterer({
-    preset: 'islands#invertedVioletClusterIcons',
-    groupByCoordinates: false,
-    clusterDisableClickZoom: false
-  });
+function init(){
+  map = new ymaps.Map('map', { center: [55.76,37.64], zoom: 5, controls:['zoomControl','searchControl','geolocationControl'] });
+  clusterer = new ymaps.Clusterer({ preset: 'islands#invertedVioletClusterIcons', groupByCoordinates:false });
   map.geoObjects.add(clusterer);
 }
 
-// отрисовать список (click -> showStation)
-function renderList(list) {
-  const el = document.getElementById('list');
-  el.innerHTML = '';
-  if(!list || !list.length){ el.innerHTML = '<div class="small">Список пуст</div>'; return; }
+// render sidebar list
+function renderList(list){
+  const el = document.getElementById('list'); el.innerHTML = '';
+  if(!list || !list.length){ el.innerHTML = '<div class="small">Ничего не найдено</div>'; return; }
   list.forEach((s, idx) => {
     const d = document.createElement('div'); d.className='station'; d.dataset.idx = idx;
     const brand = s.brand || 'АЗС';
-    d.innerHTML = '<div class="title">'+escapeHtml(brand)+'</div>'
+    let title = brand;
+    if(s.petrol_no) title += ' № ' + s.petrol_no;
+    d.innerHTML = '<div class="title">'+escapeHtml(title)+'</div>'
                 + '<div class="small">'+escapeHtml(s.address||'')+'</div>'
                 + '<div class="small">'+escapeHtml(s.region||'')+'</div>';
-    d.addEventListener('click', ()=> showStationByObject(s));
+    d.addEventListener('click', ()=> showStation(s));
     el.appendChild(d);
   });
 }
 
-// экранирование
-function escapeHtml(t){ if(!t) return ''; return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-
-// показать станцию: геокодируем адрес (если нужно) и добавляем метку
-function showStationByObject(s){
-  if(!s.address || s.address.trim()===''){ alert('У этой станции нет адреса'); return; }
-  const key = s.address;
-  if(geocodeCache[key]){
-    const coords = geocodeCache[key];
+// show station: use lat/lng if present else geocode
+function showStation(s){
+  const lat = s.lat || (s.coords && s.coords[0]);
+  const lng = s.lng || (s.coords && s.coords[1]);
+  if(lat && lng){
+    const coords = [parseFloat(lat), parseFloat(lng)];
     addPlacemark(coords, s);
     map.setCenter(coords, 14);
     return;
   }
+  // geocode by address
+  if(!s.address || !s.address.trim()){ alert('У этой станции нет адреса для геокодирования'); return; }
+  const key = s.address;
+  if(geocodeCache[key]){
+    addPlacemark(geocodeCache[key], s);
+    map.setCenter(geocodeCache[key], 14);
+    return;
+  }
+  setLoader('Геокодируем адрес — это может занять время...');
   ymaps.geocode(s.address, { results: 1 }).then(res => {
+    setLoader('');
     if(res.geoObjects.getLength()){
-      const g = res.geoObjects.get(0);
-      const coords = g.geometry.getCoordinates();
+      const coords = res.geoObjects.get(0).geometry.getCoordinates();
       geocodeCache[key] = coords;
       addPlacemark(coords, s);
       map.setCenter(coords, 14);
     } else {
-      alert('Не удалось найти координаты для адреса: ' + s.address);
+      alert('Не удалось найти координаты для: ' + s.address);
     }
   }, err => {
-    console.error('geocode err', err);
+    setLoader('');
+    console.error('geocode error', err);
     alert('Ошибка геокодирования');
   });
 }
 
-// собрать HTML карточки с ценами и сервисами
-function buildBalloonHtml(s){
-  let html = '<div style="min-width:220px">';
-  html += '<b>' + escapeHtml(s.brand||'АЗС') + '</b><br/>';
-  if(s.address) html += '<div class="small">' + escapeHtml(s.address) + '</div>';
-  if(s.region) html += '<div class="small">Регион: ' + escapeHtml(s.region) + '</div>';
-  html += '<hr/>';
-  html += '<b>Топливо:</b><ul class="fuel-list">';
+// add placemark with balloon using site template style
+function addPlacemark(coords, s){
+  // coords — [lat, lng]
+  const lat = coords[0], lng = coords[1];
+  // build balloon HTML similar to rn-card.ru template
+  const brand = s.brand || '';
+  // petrol number formatting (try fields azs_n, petrol_no etc)
+  let azsNum = s.azs_n || s.petrol_no || '';
+  // if azs_n object present (x,y,z)
+  if(typeof s.azs_n === 'object' && s.azs_n !== null){
+    azsNum = `${s.azs_n.x || ''}.${s.azs_n.y || ''}.${s.azs_n.z || ''}`;
+  }
+  let distHtml = '';
+  if(userCoords){
+    const d = haversineDistance(userCoords, [lat,lng]);
+    distHtml = Math.round(d) + ' м от вас';
+  } else {
+    distHtml = '';
+  }
+  // route link — will try to use user coords if available via geolocation; otherwise link without user point
+  const routeHref = userCoords
+    ? `https://yandex.ru/maps/?rtext=${userCoords[0]},${userCoords[1]}~${lat},${lng}&rtt=auto`
+    : `https://yandex.ru/maps/?rtext=~${lat},${lng}&rtt=auto`;
+
+  // fuel list
   const fuels = s.fuels || {};
+  let fuelsHtml = '';
   for(const k in fuels){
     const v = fuels[k];
-    if(v && String(v).trim()!==''){
-      html += '<li>' + escapeHtml(k) + (v ? ': ' + escapeHtml(v) : '') + '</li>';
-    }
+    if(v && String(v).trim()!=='') fuelsHtml += `<li>${escapeHtml(k)}: ${escapeHtml(String(v))}</li>`;
   }
-  html += '</ul>';
-  html += '<b>Сервисы:</b><div>';
-  const sv = s.services || {};
-  for(const k in sv){
-    const v = sv[k];
-    if(v && String(v).trim()!==''){
-      html += '<span class="service-tag">' + escapeHtml(k) + (v ? ': ' + escapeHtml(v) : '') + '</span>';
-    }
+  // services
+  const serv = s.services || {};
+  let servHtml = '';
+  for(const k in serv){
+    const v = serv[k];
+    if(v && String(v).trim()!=='') servHtml += `<span class="service-tag">${escapeHtml(k)}${v ? ': ' + escapeHtml(v) : ''}</span>`;
   }
-  html += '</div>';
-  if(s.nds) html += '<div class="small">НДС: ' + escapeHtml(s.nds) + '</div>';
-  html += '</div>';
-  return html;
-}
 
-// добавить метку и открыть балун
-function addPlacemark(coords, s){
-  const balloon = buildBalloonHtml(s);
-  const placemark = new ymaps.Placemark(coords, {
-    balloonContentBody: balloon,
-    hintContent: s.brand || 'АЗС'
-  }, {
-    preset: 'islands#orangeFuelStationIcon'
-  });
+  let balloon = '<div class="objs-block">';
+  balloon += `<div class="extcc-hdr"><div class="extcc-brand">${escapeHtml(brand)}</div>`;
+  if(azsNum) balloon += `<div class="extcc-numb">№ ${escapeHtml(azsNum)}</div>`;
+  balloon += `</div>`;
+  if(s.address) balloon += `<div class="ct-addr">${escapeHtml(s.address)}</div>`;
+  balloon += `<div class="ct-geo"><span>На расстоянии:</span> ${escapeHtml(distHtml)} ${distHtml ? ',' : ''} <a href="${routeHref}" target="_blank">маршрут</a></div>`;
+  balloon += `<div class="extcc-services"><b>Услуги: </b>${servHtml||'—'}</div>`;
+  if(fuelsHtml) balloon += `<hr/><b>Топливо</b><ul class="fuel-list">${fuelsHtml}</ul>`;
+  if(s.nds) balloon += `<div class="small">НДС: ${escapeHtml(s.nds)}</div>`;
+  balloon += '</div>';
+
+  const placemark = new ymaps.Placemark([lat,lng], { balloonContentBody: balloon, hintContent: s.brand || 'АЗС' }, { preset: 'islands#orangeFuelStationIcon' });
   clusterer.add(placemark);
   shownPlacemarks.push(placemark);
-  placemark.balloon.open();
+  // open balloon after small delay to ensure it's added
+  setTimeout(()=>placemark.balloon.open(), 200);
 }
 
-// очистить показанные метки (кластеры)
-function clearPlacemarks(){
-  clusterer.removeAll();
-  shownPlacemarks = [];
-  geocodeCache = {}; // можно не очищать, но если хочешь свежесть - очищаем
+// compute haversine approximate distance in meters between two [lat,lng]
+function haversineDistance(a, b){
+  const toRad = v => v * Math.PI / 180;
+  const R = 6371000;
+  const dLat = toRad(b[0]-a[0]);
+  const dLon = toRad(b[1]-a[1]);
+  const lat1 = toRad(a[0]), lat2 = toRad(b[0]);
+  const sinDlat = Math.sin(dLat/2), sinDlon = Math.sin(dLon/2);
+  const c = 2 * Math.atan2(Math.sqrt(sinDlat*sinDlat + Math.cos(lat1)*Math.cos(lat2)*sinDlon*sinDlon), Math.sqrt(1 - (sinDlat*sinDlat + Math.cos(lat1)*Math.cos(lat2)*sinDlon*sinDlon)));
+  return R * c;
 }
 
-// поиск по вводу
+// search handler
 document.getElementById('q').addEventListener('input', function(){
   const q = this.value.trim().toLowerCase();
   if(!q){ renderList(stations.slice(0,500)); setCount('Всего: ' + stations.length); return; }
-  const res = stations.filter(s => (String(s.address||'') + ' ' + String(s.region||'') + ' ' + String(s.brand||'')).toLowerCase().includes(q));
+  const res = stations.filter(s => ((s.address||'') + ' ' + (s.region||'') + ' ' + (s.brand||'')).toLowerCase().includes(q));
   renderList(res.slice(0,500));
   setCount('Найдено: ' + res.length);
 });
 
-// кнопка "Загрузить первые" — по списку сайдбара геокодирует и ставит метки до 100 штук
+// load first N from sidebar (geocode and place)
 document.getElementById('loadBtn').addEventListener('click', function(){
   const items = Array.from(document.querySelectorAll('.station')).slice(0,100);
   if(!items.length){ alert('Нечего загружать'); return; }
-  let i=0;
+  let i = 0;
   function next(){
     if(i>=items.length) return;
     const idx = items[i].dataset.idx;
     const s = stations[idx];
-    if(s) showStationByObject(s);
+    if(s) showStation(s);
     i++;
     setTimeout(next, 200);
   }
   next();
 });
 
-// кнопка "Показать ближайшие" — берём геопозицию браузера и вычисляем ближайшие станции
+// clear
+document.getElementById('clearBtn').addEventListener('click', function(){
+  clusterer.removeAll(); shownPlacemarks = [];
+});
+
+// nearest — get user location then compute nearest (geocode subset if needed)
 document.getElementById('nearBtn').addEventListener('click', function(){
   if(!navigator.geolocation){ alert('Геолокация не поддерживается'); return; }
+  setLoader('Определяем ваше местоположение...');
   navigator.geolocation.getCurrentPosition(pos => {
-    const user = [pos.coords.latitude, pos.coords.longitude];
-    // Чтобы сравнивать дистанцию без геокодирования всех, геокодируем потихоньку первые 500 записей
+    setLoader('');
+    userCoords = [pos.coords.latitude, pos.coords.longitude];
+    // ensure user marker or center
+    map.setCenter(userCoords, 10);
+    // compute distances — need coords for entries; we'll geocode lazily first 500
     const sample = stations.slice(0,500);
-    let i=0; const results=[];
+    let i = 0;
+    const results = [];
     function procNext(){
       if(i>=sample.length){
         results.sort((a,b)=>a.d-b.d);
-        const top = results.slice(0,50).map(r=>r.s);
-        renderList(top);
-        top.slice(0,10).forEach(r=>addPlacemark(r.coords, r.s));
-        map.setCenter(user, 10);
+        renderList(results.slice(0,50).map(r=>r.s));
+        // show top 10
+        results.slice(0,10).forEach(r=>addPlacemark(r.coords, r.s));
+        setCount('Показаны ближайшие: ' + results.length);
         return;
       }
       const s = sample[i++];
       const key = s.address;
       function handleCoords(coords){
-        const dx = coords[0]-user[0], dy = coords[1]-user[1];
-        const d = Math.sqrt(dx*dx + dy*dy);
+        const d = haversineDistance(userCoords, coords);
         results.push({s:s, coords:coords, d:d});
         setTimeout(procNext, 120);
       }
-      if(geocodeCache[key]) handleCoords(geocodeCache[key]);
-      else{
+      if(s.lat && s.lng){
+        handleCoords([parseFloat(s.lat), parseFloat(s.lng)]);
+      } else if(geocodeCache[key]){
+        handleCoords(geocodeCache[key]);
+      } else if(s.address && s.address.trim()!==''){
         ymaps.geocode(s.address, { results:1 }).then(res=>{
           if(res.geoObjects.getLength()){
             const coords = res.geoObjects.get(0).geometry.getCoordinates();
-            geocodeCache[key]=coords;
+            geocodeCache[key] = coords;
             handleCoords(coords);
           } else {
             setTimeout(procNext, 0);
           }
-        }, err => { console.error(err); setTimeout(procNext, 0); });
+        }, err=>{ console.error(err); setTimeout(procNext, 0); });
+      } else {
+        setTimeout(procNext, 0);
       }
     }
     procNext();
-  }, err => { alert('Не удалось получить местоположение'); }, {timeout:10000});
+  }, err => {
+    setLoader('');
+    alert('Не удалось получить местоположение: ' + (err.message || err.code));
+  }, {timeout:10000});
 });
-
-// кнопка очистки
-document.getElementById('clearBtn').addEventListener('click', function(){ clearPlacemarks(); });
-
-// утилита: показать первые N в списке из stations.json при первой загрузке
-function renderInitial(){
-  renderList(stations.slice(0,500));
-}
-
-// helper
-function setCount(text){ document.getElementById('count').innerText = text; }
 
 </script>
 </body>
